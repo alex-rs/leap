@@ -172,21 +172,22 @@ leap_agents() {
   info "Writing agent config to ${agents_config}..."
 
   # Write KEY=VALUE pairs to agents-config
-  : > "$agents_config"
-  printf 'PROJECT_DESCRIPTION_LONG=%s\n' "$PROJECT_DESCRIPTION_LONG" >> "$agents_config"
-  printf 'COMPONENTS=%s\n'               "$COMPONENTS"               >> "$agents_config"
-  printf 'HAS_FRONTEND=%s\n'            "$HAS_FRONTEND"              >> "$agents_config"
-  printf 'FRONTEND_FRAMEWORK=%s\n'      "$FRONTEND_FRAMEWORK"        >> "$agents_config"
-  printf 'HAS_BACKEND=%s\n'             "$HAS_BACKEND"               >> "$agents_config"
-  printf 'HAS_INFRA=%s\n'              "$HAS_INFRA"                  >> "$agents_config"
-  printf 'INFRA_PROVIDER=%s\n'          "$INFRA_PROVIDER"            >> "$agents_config"
-  printf 'HAS_BILLING=%s\n'             "$HAS_BILLING"               >> "$agents_config"
-  printf 'BILLING_PROVIDER=%s\n'        "$BILLING_PROVIDER"          >> "$agents_config"
-  printf 'HAS_GTM=%s\n'                "$HAS_GTM"                    >> "$agents_config"
-  printf 'CUSTOM_AGENTS=%s\n'           "$CUSTOM_AGENTS"             >> "$agents_config"
-  for agent_name in "${!custom_descriptions[@]}"; do
-    printf 'CUSTOM_%s_DESCRIPTION=%s\n' "$agent_name" "${custom_descriptions[$agent_name]}" >> "$agents_config"
-  done
+  {
+    printf 'PROJECT_DESCRIPTION_LONG=%s\n' "$PROJECT_DESCRIPTION_LONG"
+    printf 'COMPONENTS=%s\n'               "$COMPONENTS"
+    printf 'HAS_FRONTEND=%s\n'             "$HAS_FRONTEND"
+    printf 'FRONTEND_FRAMEWORK=%s\n'       "$FRONTEND_FRAMEWORK"
+    printf 'HAS_BACKEND=%s\n'              "$HAS_BACKEND"
+    printf 'HAS_INFRA=%s\n'               "$HAS_INFRA"
+    printf 'INFRA_PROVIDER=%s\n'           "$INFRA_PROVIDER"
+    printf 'HAS_BILLING=%s\n'              "$HAS_BILLING"
+    printf 'BILLING_PROVIDER=%s\n'         "$BILLING_PROVIDER"
+    printf 'HAS_GTM=%s\n'                 "$HAS_GTM"
+    printf 'CUSTOM_AGENTS=%s\n'            "$CUSTOM_AGENTS"
+    for agent_name in "${!custom_descriptions[@]}"; do
+      printf 'CUSTOM_%s_DESCRIPTION=%s\n' "$agent_name" "${custom_descriptions[$agent_name]}"
+    done
+  } > "$agents_config"
 
   # ── 4. Build merged config ────────────────────────────────────────────────────
 
@@ -294,10 +295,12 @@ leap_agents() {
       # Use a fresh temp file with the agent vars appended
       local agent_config
       agent_config="$(mktemp /tmp/leap-agents-custom.XXXXXX)"
-      cat "$merged_config" > "$agent_config"
-      printf 'AGENT_NAME=%s\n'        "$slug"  >> "$agent_config"
-      printf 'AGENT_DESCRIPTION=%s\n' "$desc"  >> "$agent_config"
-      printf 'AGENT_EXPERTISE=%s\n'   "- Expertise specific to the ${agent_name} domain for this project." >> "$agent_config"
+      {
+        cat "$merged_config"
+        printf 'AGENT_NAME=%s\n'        "$slug"
+        printf 'AGENT_DESCRIPTION=%s\n' "$desc"
+        printf 'AGENT_EXPERTISE=%s\n'   "- Expertise specific to the ${agent_name} domain for this project."
+      } > "$agent_config"
 
       copy_template "$TMPL/agents/custom-agent.md.tmpl" "$AGENTS_DIR/${slug}.md" "$agent_config"
       rm -f "$agent_config"

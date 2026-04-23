@@ -26,8 +26,6 @@ leap_init() {
   existing_remote="$(config_get GIT_REMOTE 2>/dev/null || true)"
   [[ -z "$existing_remote" ]] && existing_remote="$auto_remote"
 
-  local existing_db
-  existing_db="$(config_get DATABASE 2>/dev/null || true)"
 
   local existing_opencode
   existing_opencode="$(config_get HAS_OPENCODE 2>/dev/null || true)"
