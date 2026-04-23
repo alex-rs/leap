@@ -205,6 +205,27 @@ leap_init() {
     copy_template "$TMPL/skills/opencode-review.md.tmpl"  ".claude/skills/opencode-review/SKILL.md"
   fi
 
+  # Claude Code hooks (lint-on-edit)
+  copy_template "$TMPL/hooks/lint-on-edit.sh.tmpl" ".claude/hooks/lint-on-edit.sh"
+  if [[ -f ".claude/settings.local.json" ]]; then
+    if ! grep -q '"hooks"' ".claude/settings.local.json" 2>/dev/null; then
+      local _tmp_settings
+      _tmp_settings="$(mktemp)"
+      if command -v jq &>/dev/null; then
+        if jq -s '.[0] * .[1]' ".claude/settings.local.json" "$TMPL/hooks/settings.json.tmpl" > "$_tmp_settings" 2>/dev/null; then
+          mv "$_tmp_settings" ".claude/settings.local.json"
+        else
+          rm -f "$_tmp_settings"
+        fi
+      else
+        rm -f "$_tmp_settings"
+        warn "jq not found — add hooks config to .claude/settings.local.json manually"
+      fi
+    fi
+  else
+    cp "$TMPL/hooks/settings.json.tmpl" ".claude/settings.local.json"
+  fi
+
   # Always create .claude/agents/ (populated by `leap agents`)
   mkdir -p ".claude/agents"
 
@@ -223,6 +244,7 @@ leap_init() {
   echo "  ops/pre-receive/             — server-side git hooks"
   echo "  .github/workflows/           — CI pipelines"
   echo "  lefthook.yml                 — client-side git hooks"
+  echo "  .claude/hooks/               — post-edit lint enforcement"
   echo "  coverage/baseline.json       — coverage ratchet baseline"
   echo ""
   echo "Next steps:"

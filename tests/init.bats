@@ -35,6 +35,29 @@ _run_init() {
   [ -f .github/workflows/pr.yml ]
   [ -f .github/workflows/nightly.yml ]
   [ -d .claude/agents ]
+  [ -f .claude/hooks/lint-on-edit.sh ]
+  [ -x .claude/hooks/lint-on-edit.sh ]
+  [ -f .claude/settings.local.json ]
+}
+
+@test "lint hook contains language-appropriate linter" {
+  _run_init "myproj" "A test" "" "1" "1" "1" "n" "cto" "admin" "" "" > /dev/null
+  grep -q "biome" .claude/hooks/lint-on-edit.sh
+  # python/go blocks should not be present for typescript-only
+  ! grep -q "ruff" .claude/hooks/lint-on-edit.sh
+  ! grep -q "golangci-lint" .claude/hooks/lint-on-edit.sh
+}
+
+@test "lint hook for python uses ruff" {
+  _run_init "myproj" "A test" "" "2" "4" "1" "n" "cto" "admin" "" "" > /dev/null
+  grep -q "ruff" .claude/hooks/lint-on-edit.sh
+  ! grep -q "biome" .claude/hooks/lint-on-edit.sh
+}
+
+@test "lint hook settings has PostToolUse config" {
+  _run_init "myproj" "A test" "" "1" "1" "1" "n" "cto" "admin" "" "" > /dev/null
+  grep -q "PostToolUse" .claude/settings.local.json
+  grep -q "lint-on-edit" .claude/settings.local.json
 }
 
 @test "init scaffolds typescript-specific files" {

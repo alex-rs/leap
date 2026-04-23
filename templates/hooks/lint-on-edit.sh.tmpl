@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT=$(cat)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+if [[ -z "$FILE_PATH" || ! -f "$FILE_PATH" ]]; then
+  exit 0
+fi
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-.}"
+LINT_OUTPUT=""
+LINT_FAILED=0
+
+case "$FILE_PATH" in
+%%IF LANGUAGE_TYPESCRIPT%%
+  *.ts|*.tsx|*.js|*.jsx|*.json|*.jsonc)
+    if [[ -x "${PROJECT_DIR}/node_modules/.bin/biome" ]]; then
+      LINT_OUTPUT=$("${PROJECT_DIR}/node_modules/.bin/biome" check --no-errors-on-unmatched "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    elif command -v biome &>/dev/null; then
+      LINT_OUTPUT=$(biome check --no-errors-on-unmatched "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    fi
+    ;;
+%%ENDIF%%
+%%IF LANGUAGE_PYTHON%%
+  *.py)
+    if command -v ruff &>/dev/null; then
+      LINT_OUTPUT=$(ruff check "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    fi
+    ;;
+%%ENDIF%%
+%%IF LANGUAGE_GO%%
+  *.go)
+    if command -v golangci-lint &>/dev/null; then
+      LINT_OUTPUT=$(golangci-lint run --no-config --disable-all \
+        -E unused -E govet -E errcheck -E staticcheck -E revive \
+        --max-issues-per-linter 10 --max-same-issues 3 \
+        "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    fi
+    ;;
+%%ENDIF%%
+%%IF LANGUAGE_RUST%%
+  *.rs)
+    if command -v cargo &>/dev/null; then
+      LINT_OUTPUT=$(cargo clippy --message-format short 2>&1 | grep -F "$(basename "$FILE_PATH")" || true)
+      [[ -n "$LINT_OUTPUT" ]] && LINT_FAILED=1
+    fi
+    ;;
+%%ENDIF%%
+%%IF LANGUAGE_MULTI%%
+  *.ts|*.tsx|*.js|*.jsx|*.json|*.jsonc)
+    if [[ -x "${PROJECT_DIR}/node_modules/.bin/biome" ]]; then
+      LINT_OUTPUT=$("${PROJECT_DIR}/node_modules/.bin/biome" check --no-errors-on-unmatched "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    elif command -v biome &>/dev/null; then
+      LINT_OUTPUT=$(biome check --no-errors-on-unmatched "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    fi
+    ;;
+  *.py)
+    if command -v ruff &>/dev/null; then
+      LINT_OUTPUT=$(ruff check "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    fi
+    ;;
+  *.go)
+    if command -v golangci-lint &>/dev/null; then
+      LINT_OUTPUT=$(golangci-lint run --no-config --disable-all \
+        -E unused -E govet -E errcheck -E staticcheck -E revive \
+        --max-issues-per-linter 10 --max-same-issues 3 \
+        "$FILE_PATH" 2>&1) || LINT_FAILED=1
+    fi
+    ;;
+%%ENDIF%%
+esac
+
+if (( LINT_FAILED )); then
+  echo "$LINT_OUTPUT" >&2
+  exit 2
+fi
+
+exit 0

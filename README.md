@@ -78,6 +78,7 @@ ops/checks/                      # CI enforcement scripts
 ops/pre-receive/                 # server-side git hooks
 .github/workflows/               # PR gate + nightly CI
 .claude/agents/                  # agent role definitions
+.claude/hooks/                   # post-edit lint enforcement
 lefthook.yml                     # client-side hooks
 coverage/baseline.json           # coverage ratchet seed
 Makefile                         # dev/lint/test/check targets
@@ -97,7 +98,7 @@ After scaffolding, customize by editing the generated files directly. The govern
 bats tests/
 ```
 
-65 tests covering the template engine, config persistence, scaffold completeness across all supported stacks, agent generation and cleanup, and re-run idempotency.
+68 tests covering the template engine, config persistence, scaffold completeness across all supported stacks, agent generation and cleanup, lint hooks, and re-run idempotency.
 
 ## Requirements
 
