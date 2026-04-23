@@ -34,7 +34,7 @@ Two commands. Both interactive, both re-runnable.
 
 ```
 git clone https://github.com/alex-rs/leap.git ~/leap
-export PATH="$HOME/leap/bin:$PATH"
+export PATH="$HOME/leap:$PATH"
 ```
 
 ## Usage

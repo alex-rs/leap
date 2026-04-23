@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LEAP_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LEAP_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${LEAP_HOME}/lib/utils.sh"
 
 case "${1:-help}" in

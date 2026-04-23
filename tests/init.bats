@@ -16,7 +16,7 @@ teardown() {
 }
 
 _run_init() {
-  printf '%s\n' "$@" | "${LEAP_HOME}/bin/leap" init 2>&1
+  printf '%s\n' "$@" | "${LEAP_HOME}/leap" init 2>&1
 }
 
 # ── scaffold completeness ─────────────────────────────────────────────────────

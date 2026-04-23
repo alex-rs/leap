@@ -12,7 +12,7 @@ setup() {
 
   # Run init first (typescript, no opencode)
   printf 'testproj\nA test\n\n1\n1\n1\nn\ncto\nadm\n\n\n' \
-    | "${LEAP_HOME}/bin/leap" init > /dev/null 2>&1
+    | "${LEAP_HOME}/leap" init > /dev/null 2>&1
 }
 
 teardown() {
@@ -20,7 +20,7 @@ teardown() {
 }
 
 _run_agents() {
-  printf '%s\n' "$@" | "${LEAP_HOME}/bin/leap" agents 2>&1
+  printf '%s\n' "$@" | "${LEAP_HOME}/leap" agents 2>&1
 }
 
 # ── core agents always generated ──────────────────────────────────────────────
@@ -137,7 +137,7 @@ _run_agents() {
 @test "opencode mirror created when enabled" {
   # Re-init with opencode enabled
   printf 'testproj\nA test\n\n1\n1\n1\ny\ncto\noc\nadm\n\n\n' \
-    | "${LEAP_HOME}/bin/leap" init > /dev/null 2>&1
+    | "${LEAP_HOME}/leap" init > /dev/null 2>&1
 
   _run_agents "A test" "api" "n" "y" "n" "n" "n" "" > /dev/null
   [ -d .opencode/agents ]
@@ -148,13 +148,13 @@ _run_agents() {
 @test "opencode mirror cleaned when disabled" {
   # Init with opencode enabled, run agents
   printf 'testproj\nA test\n\n1\n1\n1\ny\ncto\noc\nadm\n\n\n' \
-    | "${LEAP_HOME}/bin/leap" init > /dev/null 2>&1
+    | "${LEAP_HOME}/leap" init > /dev/null 2>&1
   _run_agents "A test" "api" "n" "y" "n" "n" "n" "" > /dev/null
   [ -d .opencode/agents ]
 
   # Re-init with opencode disabled, run agents again
   printf 'testproj\nA test\n\n1\n1\n1\nn\ncto\nadm\n\n\n' \
-    | "${LEAP_HOME}/bin/leap" init > /dev/null 2>&1
+    | "${LEAP_HOME}/leap" init > /dev/null 2>&1
   _run_agents "A test" "api" "n" "y" "n" "n" "n" "" > /dev/null
   [ ! -d .opencode/agents ]
 }
