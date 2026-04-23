@@ -138,10 +138,8 @@ render_template() {
   for key in "${!_cfg[@]}"; do
     local val="${_cfg[$key]}"
     local pattern="%%${key}%%"
-    # Escape & and \ in the replacement value for awk gsub
-    local safe_val="${val//\\/\\\\}"
-    safe_val="${safe_val//&/\\&}"
-    awk -v pat="$pattern" -v rep="$safe_val" '{gsub(pat, rep); print}' "$_tmpfile" > "${_tmpfile}.out"
+    _LEAP_PAT="$pattern" _LEAP_REP="$val" \
+      awk 'BEGIN{p=ENVIRON["_LEAP_PAT"]; r=ENVIRON["_LEAP_REP"]; gsub(/\\/, "\\\\", r); gsub(/&/, "\\\\&", r)} {gsub(p, r); print}' "$_tmpfile" > "${_tmpfile}.out"
     mv "${_tmpfile}.out" "$_tmpfile"
   done
 

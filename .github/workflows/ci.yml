@@ -17,6 +17,11 @@ jobs:
           git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
           sudo /tmp/bats/install.sh /usr/local
 
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.email "ci@test.local"
+          git config --global user.name "CI"
+
       - name: Run tests
         run: bats tests/
 
