@@ -1,0 +1,5 @@
+# Waiver ledger — every entry must have an expiry (max 90 days, 14 days for flaky-test)
+# Schema: id, kind, path, line (optional), rule (optional), issue, reason, approved_by, added, expires
+# Kinds: eslint-disable | nolint | knip-ignore | ts-ignore | flaky-test | mutation-exception | test-removal-approved
+# Enforced by: ops/pre-receive/waiver-schema.sh (on change) + ops/checks/waiver-expiry-check.sh (every PR)
+[]

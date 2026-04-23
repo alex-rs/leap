@@ -1,0 +1,69 @@
+# Backlog
+
+One file per task. File name: `TASK-NNN.md` with zero-padded sequential ID (`TASK-001`, `TASK-042`, `TASK-137`). Never reuse an ID.
+
+## Status field
+
+Cached in frontmatter but **not authoritative**. Authoritative state is git + VCS PR API. `ops/checks/verify-task-done.sh` reconciles.
+
+| Status      | Meaning                                                              |
+|-------------|----------------------------------------------------------------------|
+| `todo`      | Written, owner assigned, not yet delegated                           |
+| `doing`     | Delegated, PR open, work in flight                                   |
+| `blocked`   | Stuck: missing dep, scope breach, founder interrupt, CI red          |
+| `done`      | Verified via `verify-task-done.sh`, PR merged, ci-gatekeeper approved|
+
+## Caps
+
+- `doing` ≤ 5 at any time. CTO refuses to delegate a sixth until one closes.
+- Active (`todo` + `doing` + `blocked`) ≤ 25. Exceeding triggers archival pass.
+- Body ≤ 3 sentences. If longer, split the task.
+
+## Lifecycle
+
+1. CTO writes the task file with `status: todo`, owner from escalation matrix.
+2. CTO delegates via Agent-tool using the outbound contract in `docs/cto.md`. Status → `doing`.
+3. Subagent opens the PR and writes its inbound contract block as the last action into this file.
+4. CTO runs `ops/checks/verify-task-done.sh TASK-NNN`. If every check passes and PR is merged → `done`. Otherwise → `blocked` with `blocked_reason`.
+5. After `done` + 7 days post-merge, task compacts to `docs/backlog/archive/YYYY-MM.md` (one line: id, title, commit, pr). Individual file deleted.
+
+## Frontmatter schema
+
+See `TASK-000-template.md` for the canonical template. Required fields:
+
+- `id` — `TASK-NNN`
+- `title` — imperative, ≤80 chars
+- `status` — one of `todo | doing | blocked | done`
+- `owner` — subagent name from escalation matrix
+- `depends_on` — list of task IDs; may be empty
+- `files_allowlist` — globs the subagent is permitted to touch
+- `must_not_touch` — globs the subagent must not touch (protected paths default included)
+- `acceptance_criteria` — testable bullets; each should name a symbol, file, or observable behavior
+- `pr` — PR number, filled when opened
+- `commit` — short SHA of merge commit, filled on verification
+- `ci_status` — `pending | approved | failed | not_applicable`
+- `blocked_reason` — string when `status: blocked`, else null
+- `created` — ISO date
+- `last_verified` — ISO timestamp, updated by `verify-task-done.sh`
+- `escalate_to` — list of subagent names for review; pulled from escalation matrix
+
+## Archive format
+
+`docs/backlog/archive/YYYY-MM.md` is append-only. One line per archived task:
+
+```
+- TASK-042 — Add webhook idempotency check — commit abc1234 — pr #17
+```
+
+No frontmatter. Full history lives in git; this file is a human-readable index.
+
+## Anti-drift rules
+
+- **No status field written without verification.** If CTO cannot run `verify-task-done.sh`, status stays at its last verified value.
+- **No task manufactured by CTO alone.** Every new task traces to founder input or a founder-approved plan file.
+- **No direct edits to `done` tasks.** If a `done` task needs revision, open a new task that supersedes it.
+- **No renaming of task IDs.** If a task is wrong, mark it `blocked` with `blocked_reason: superseded-by-TASK-NNN` and open a new one.
+
+---
+
+%%PROJECT_NAME%% backlog is maintained by CTO under the governance rules above. Questions about task state → run `ops/checks/verify-task-done.sh`. Questions about task creation → consult `docs/cto.md`.

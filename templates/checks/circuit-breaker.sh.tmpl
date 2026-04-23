@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# checks/circuit-breaker.sh — retry circuit breaker for ci-gatekeeper.
+#
+# Tracks per-PR, per-check-signature failed attempt counts. On the 2nd
+# failure (attempt budget = 2), posts a freeze comment on the PR, locks
+# a local state file, and exits non-zero so the caller knows to stop.
+#
+# The 3rd call for the same (PR, signature) pair returns exit code 3
+# (frozen) immediately without posting again.
+#
+# Unfreeze: a human or devex-engineer posts a `ci-gatekeeper:unfreeze`
+# comment on the PR citing the failing-signature hash. The unfreeze
+# command clears the state file entry. ci-gatekeeper never self-unfreezes.
+#
+# Usage:
+#   circuit-breaker.sh record   <pr_number> <check_sig> <diff_url>
+#     → returns 0 (ok, under budget), 2 (now frozen), or 3 (already frozen)
+#   circuit-breaker.sh check    <pr_number> <check_sig>
+#     → returns 0 (ok), 3 (frozen — stop immediately)
+#   circuit-breaker.sh unfreeze <pr_number> <check_sig> [comment_url]
+#     → clears frozen state; caller must verify human-authored unfreeze comment
+#   circuit-breaker.sh status   <pr_number> <check_sig>
+#     → prints "ok N/2", "frozen", or "not-found"; exits 0 always
+#
+# State directory: $CIRCUIT_BREAKER_DIR (default: /tmp/%%PROJECT_NAME%%-circuit-breaker)
+# In production, mount a persistent volume here so state survives restarts.
+#
+# Env vars used:
+#   GH_TOKEN            — ci-gatekeeper API token (for posting freeze comments)
+#   GH_REPO             — repository in owner/name format (default: $GITHUB_REPOSITORY)
+#   CIRCUIT_BREAKER_DIR — state directory
+#   CIRCUIT_BREAKER_BUDGET — max attempts before freeze (default: 2)
+
+set -euo pipefail
+
+GH_REPO="${GH_REPO:-${GITHUB_REPOSITORY:-}}"
+GH_TOKEN="${GH_TOKEN:-}"
+STATE_DIR="${CIRCUIT_BREAKER_DIR:-/tmp/%%PROJECT_NAME%%-circuit-breaker}"
+BUDGET="${CIRCUIT_BREAKER_BUDGET:-2}"
+
+mkdir -p "${STATE_DIR}"
+
+usage() {
+  echo "usage: $0 record|check|unfreeze|status <pr_number> <check_sig> [diff_url]" >&2
+  exit 1
+}
+
+[[ $# -lt 3 ]] && usage
+
+CMD="$1"
+PR_NUMBER="$2"
+CHECK_SIG="$3"
+DIFF_URL="${4:-}"
+
+# State file path: one file per (PR, check_sig). Signature is URL-safe via sha256.
+SIG_HASH="$(printf '%s' "${PR_NUMBER}:${CHECK_SIG}" | sha256sum | awk '{print $1}')"
+STATE_FILE="${STATE_DIR}/pr${PR_NUMBER}-${SIG_HASH}.state"
+
+# State file format (YAML-ish, one key per line):
+#   status: ok | frozen
+#   attempts: N
+#   attempts_log: <url1> <url2> ...
+#   sig: <original check_sig>
+#   pr: <pr_number>
+
+read_state() {
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    echo "not-found"
+    return
+  fi
+  grep "^status:" "${STATE_FILE}" | awk '{print $2}'
+}
+
+read_attempts() {
+  if [[ ! -f "${STATE_FILE}" ]]; then echo 0; return; fi
+  grep "^attempts:" "${STATE_FILE}" | awk '{print $2}'
+}
+
+read_attempts_log() {
+  if [[ ! -f "${STATE_FILE}" ]]; then echo ""; return; fi
+  grep "^attempts_log:" "${STATE_FILE}" | sed 's/^attempts_log: //'
+}
+
+post_freeze_comment() {
+  local pr="$1"
+  local sig="$2"
+  local hash="$3"
+  local prev_diffs="$4"
+
+  if [[ -z "${GH_TOKEN}" ]]; then
+    echo "[circuit-breaker] WARNING: GH_TOKEN not set; skipping freeze comment post" >&2
+    return
+  fi
+
+  if [[ -z "${GH_REPO}" ]]; then
+    echo "[circuit-breaker] WARNING: GH_REPO not set; skipping freeze comment post" >&2
+    return
+  fi
+
+  local body
+  body="$(cat <<COMMENT_EOF
+**ci-gatekeeper: PR FROZEN — circuit breaker triggered**
+
+Check signature \`${sig}\` has failed **3 times** on this PR. The retry budget (2 attempts) is exhausted.
+
+**Failing-signature hash:** \`${hash}\`
+
+**Prior failing attempt URLs:**
+${prev_diffs}
+
+**This PR is now blocked from merge** even if later CI runs pass.
+
+To unblock: a human or \`devex-engineer\` must post the following comment on this PR (copy verbatim):
+
+\`\`\`
+ci-gatekeeper:unfreeze ${hash}
+\`\`\`
+
+\`ci-gatekeeper\` will re-evaluate on the next push with a fresh attempt budget. It will never self-unfreeze.
+
+_Escalation: devex-engineer + human review required._
+COMMENT_EOF
+)"
+
+  local body_json
+  body_json="$(printf '%s' "${body}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
+
+  curl -s \
+    -H "Authorization: token ${GH_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -X POST "https://api.github.com/repos/${GH_REPO}/issues/${pr}/comments" \
+    -d "{\"body\": ${body_json}}" \
+    >/dev/null 2>&1 || echo "[circuit-breaker] WARNING: failed to post freeze comment" >&2
+}
+
+case "${CMD}" in
+  check)
+    STATUS="$(read_state)"
+    if [[ "${STATUS}" == "frozen" ]]; then
+      echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG} is FROZEN — stop immediately" >&2
+      exit 3
+    fi
+    echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG} status=${STATUS} — ok to proceed" >&2
+    exit 0
+    ;;
+
+  record)
+    STATUS="$(read_state)"
+
+    if [[ "${STATUS}" == "frozen" ]]; then
+      echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG} already FROZEN — skipping re-record" >&2
+      exit 3
+    fi
+
+    ATTEMPTS="$(read_attempts)"
+    NEW_ATTEMPTS=$((ATTEMPTS + 1))
+    PREV_LOG="$(read_attempts_log)"
+    NEW_LOG="${PREV_LOG}${PREV_LOG:+ }${DIFF_URL}"
+
+    if [[ ${NEW_ATTEMPTS} -le ${BUDGET} ]]; then
+      # Under budget — record and return ok
+      cat > "${STATE_FILE}" <<STATE_EOF
+status: ok
+attempts: ${NEW_ATTEMPTS}
+attempts_log: ${NEW_LOG}
+sig: ${CHECK_SIG}
+pr: ${PR_NUMBER}
+sig_hash: ${SIG_HASH}
+STATE_EOF
+      echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG} attempt ${NEW_ATTEMPTS}/${BUDGET} recorded" >&2
+      exit 0
+    else
+      # Budget exhausted — freeze
+      cat > "${STATE_FILE}" <<STATE_EOF
+status: frozen
+attempts: ${NEW_ATTEMPTS}
+attempts_log: ${NEW_LOG}
+sig: ${CHECK_SIG}
+pr: ${PR_NUMBER}
+sig_hash: ${SIG_HASH}
+STATE_EOF
+      echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG} FROZEN after ${NEW_ATTEMPTS} attempts" >&2
+
+      # Format prior diffs for comment
+      FORMATTED_DIFFS=""
+      i=1
+      for url in ${PREV_LOG}; do
+        FORMATTED_DIFFS="${FORMATTED_DIFFS}- Attempt ${i}: ${url}
+"
+        i=$((i + 1))
+      done
+      [[ -n "${DIFF_URL}" ]] && FORMATTED_DIFFS="${FORMATTED_DIFFS}- Attempt ${NEW_ATTEMPTS}: ${DIFF_URL}
+"
+
+      post_freeze_comment "${PR_NUMBER}" "${CHECK_SIG}" "${SIG_HASH}" "${FORMATTED_DIFFS}"
+      exit 2
+    fi
+    ;;
+
+  unfreeze)
+    STATUS="$(read_state)"
+    if [[ "${STATUS}" == "not-found" ]]; then
+      echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG}: no state found; nothing to unfreeze" >&2
+      exit 0
+    fi
+    if [[ "${STATUS}" != "frozen" ]]; then
+      echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG}: not frozen (status=${STATUS}); nothing to do" >&2
+      exit 0
+    fi
+    # Clear the state so next push gets a fresh budget
+    rm -f "${STATE_FILE}"
+    echo "[circuit-breaker] PR #${PR_NUMBER} sig=${CHECK_SIG} hash=${SIG_HASH}: UNFROZEN — fresh budget on next push" >&2
+    exit 0
+    ;;
+
+  status)
+    STATUS="$(read_state)"
+    ATTEMPTS="$(read_attempts)"
+    case "${STATUS}" in
+      frozen)    echo "frozen" ;;
+      ok)        echo "ok ${ATTEMPTS}/${BUDGET}" ;;
+      not-found) echo "not-found" ;;
+      *)         echo "unknown: ${STATUS}" ;;
+    esac
+    exit 0
+    ;;
+
+  *)
+    usage
+    ;;
+esac

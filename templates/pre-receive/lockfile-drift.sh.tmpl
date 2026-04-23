@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# pre-receive/lockfile-drift.sh — lockfile drift detector.
+#
+# Blocks pushes where package manifests changed without corresponding lockfile
+# updates (or vice versa). Prevents the repo from drifting into a state where
+# install commands would produce different results than what CI is testing.
+#
+# Package manager: %%PACKAGE_MANAGER%%
+# Language: %%LANGUAGE%%
+#
+# Context passed by pre-receive dispatcher:
+#   HOOK_FILES_FILE — one changed filename per line (aggregated across all commits)
+#
+# Exit 0 = clean. Exit 1 = drift detected (push blocked).
+
+set -uo pipefail
+
+FILES_FILE="${HOOK_FILES_FILE:-/dev/null}"
+
+CHANGED_PACKAGE_JSON=false
+CHANGED_PNPM_LOCK=false
+CHANGED_PNPM_WORKSPACE=false
+CHANGED_NPM_LOCK=false
+CHANGED_YARN_LOCK=false
+CHANGED_GO_MOD=false
+CHANGED_GO_SUM=false
+
+while IFS= read -r FILE; do
+  [[ -z "$FILE" ]] && continue
+  case "$FILE" in
+    *package.json)         CHANGED_PACKAGE_JSON=true ;;
+    pnpm-lock.yaml)        CHANGED_PNPM_LOCK=true ;;
+    pnpm-workspace.yaml)   CHANGED_PNPM_WORKSPACE=true ;;
+    package-lock.json)     CHANGED_NPM_LOCK=true ;;
+    yarn.lock)             CHANGED_YARN_LOCK=true ;;
+    go.mod)                CHANGED_GO_MOD=true ;;
+    go.sum)                CHANGED_GO_SUM=true ;;
+  esac
+done < "$FILES_FILE"
+
+FOUND=0
+PKG_MGR="%%PACKAGE_MANAGER%%"
+LANG="%%LANGUAGE%%"
+
+# pnpm rules
+if [[ "$PKG_MGR" == "pnpm" ]]; then
+  if $CHANGED_PACKAGE_JSON && ! $CHANGED_PNPM_LOCK; then
+    echo "[lockfile-drift] package.json was modified but pnpm-lock.yaml was not updated." >&2
+    echo "  Run 'pnpm install' and include pnpm-lock.yaml in your commit." >&2
+    FOUND=1
+  fi
+
+  if $CHANGED_PNPM_WORKSPACE && ! $CHANGED_PNPM_LOCK; then
+    echo "[lockfile-drift] pnpm-workspace.yaml was modified but pnpm-lock.yaml was not updated." >&2
+    echo "  Run 'pnpm install' and include pnpm-lock.yaml in your commit." >&2
+    FOUND=1
+  fi
+
+  if $CHANGED_PNPM_LOCK && ! $CHANGED_PACKAGE_JSON && ! $CHANGED_PNPM_WORKSPACE; then
+    echo "[lockfile-drift] pnpm-lock.yaml changed but no package.json was modified." >&2
+    echo "  pnpm-lock.yaml must not be manually edited." >&2
+    FOUND=1
+  fi
+fi
+
+# npm rules
+if [[ "$PKG_MGR" == "npm" ]]; then
+  if $CHANGED_PACKAGE_JSON && ! $CHANGED_NPM_LOCK; then
+    echo "[lockfile-drift] package.json was modified but package-lock.json was not updated." >&2
+    echo "  Run 'npm install' and include package-lock.json in your commit." >&2
+    FOUND=1
+  fi
+
+  if $CHANGED_NPM_LOCK && ! $CHANGED_PACKAGE_JSON; then
+    echo "[lockfile-drift] package-lock.json changed but no package.json was modified." >&2
+    echo "  package-lock.json must not be manually edited." >&2
+    FOUND=1
+  fi
+fi
+
+# yarn rules
+if [[ "$PKG_MGR" == "yarn" ]]; then
+  if $CHANGED_PACKAGE_JSON && ! $CHANGED_YARN_LOCK; then
+    echo "[lockfile-drift] package.json was modified but yarn.lock was not updated." >&2
+    echo "  Run 'yarn install' and include yarn.lock in your commit." >&2
+    FOUND=1
+  fi
+
+  if $CHANGED_YARN_LOCK && ! $CHANGED_PACKAGE_JSON; then
+    echo "[lockfile-drift] yarn.lock changed but no package.json was modified." >&2
+    echo "  yarn.lock must not be manually edited." >&2
+    FOUND=1
+  fi
+fi
+
+# Go rules (for go or multi-language projects)
+if [[ "$LANG" == "go" || "$LANG" == "multi" || "$PKG_MGR" == "go" ]]; then
+  if $CHANGED_GO_MOD && ! $CHANGED_GO_SUM; then
+    echo "[lockfile-drift] go.mod was modified but go.sum was not updated." >&2
+    echo "  Run 'go mod tidy' and include go.sum in your commit." >&2
+    FOUND=1
+  fi
+
+  if $CHANGED_GO_SUM && ! $CHANGED_GO_MOD; then
+    echo "[lockfile-drift] go.sum changed but go.mod was not modified." >&2
+    echo "  go.sum must not be manually edited. Run 'go mod tidy' instead." >&2
+    FOUND=1
+  fi
+fi
+
+if [[ $FOUND -ne 0 ]]; then
+  echo "" >&2
+  echo "[lockfile-drift] Push blocked. Fix drift violations above." >&2
+  exit 1
+fi
+
+exit 0

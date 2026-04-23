@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+#
+# oc-gate.sh TASK-NNN [--record pass|fail]
+#
+# Two-phase CTO gate review tool for opencode-executed tasks.
+#
+# Phase 1 (bundle):  oc-gate.sh TASK-NNN
+#   Verifies a PR exists for the task, then prints a review bundle to stdout:
+#     - TASK frontmatter
+#     - Plan acceptance section
+#     - Full git diff vs main
+#     - CI check summary
+#     - HIGHLIGHT section listing any changed file under sensitive shared paths
+#   Stamps a start-time state file at /tmp/%%PROJECT_NAME%%-gate-<TASK_ID>.state.
+#   Exits 1 if no PR is recorded in the task frontmatter.
+#
+# Phase 2 (record): oc-gate.sh TASK-NNN --record pass|fail
+#   Reads the state file, computes cto_review_wall_time_seconds, and updates the
+#   last matching task_id line in ops/telemetry/opencode-spend.jsonl in place by
+#   appending cto_review_wall_time_seconds and cto_review_outcome.
+#
+# Exit codes:
+#   0   — success
+#   1   — invocation error, missing tools, or no PR open (exit before bundle)
+#   2   — record phase: state file missing (bundle phase was not run)
+
+set -euo pipefail
+
+# ── Binary overrides (set in tests to inject fakes) ───────────────────────────
+: "${GH_BIN:=gh}"
+: "${YQ_BIN:=yq}"
+: "${GIT_BIN:=git}"
+: "${JQ_BIN:=jq}"
+
+# ── Repository root ────────────────────────────────────────────────────────────
+REPO_ROOT="$("$GIT_BIN" rev-parse --show-toplevel)"
+
+# ── Task directory (override in tests) ────────────────────────────────────────
+: "${TASK_DIR:=${REPO_ROOT}/docs/backlog}"
+
+# ── Telemetry file ────────────────────────────────────────────────────────────
+TELEMETRY_FILE="${REPO_ROOT}/ops/telemetry/opencode-spend.jsonl"
+
+# ── Plan file ─────────────────────────────────────────────────────────────────
+# Override with the path to the active plan file for this project.
+PLAN_FILE="${PLAN_FILE:-${REPO_ROOT}/docs/plans/active.md}"
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+TASK_ID=""
+RECORD_OUTCOME=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --record)
+      shift
+      RECORD_OUTCOME="${1:-}"
+      ;;
+    TASK-*)
+      TASK_ID="$1"
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      echo "usage: $0 TASK-NNN [--record pass|fail]" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "usage: $0 TASK-NNN [--record pass|fail]" >&2
+  exit 1
+fi
+
+if [[ ! "$TASK_ID" =~ ^TASK-[A-Z0-9-]+$ ]]; then
+  echo "invalid TASK_ID format: $TASK_ID" >&2
+  exit 1
+fi
+
+TASK_FILE="${TASK_DIR}/${TASK_ID}.md"
+
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "task file not found: $TASK_FILE" >&2
+  exit 1
+fi
+
+# ── State file path ───────────────────────────────────────────────────────────
+STATE_FILE="/tmp/%%PROJECT_NAME%%-gate-${TASK_ID}.state"
+
+# ── Tool checks ───────────────────────────────────────────────────────────────
+for bin in "$YQ_BIN" "$GIT_BIN" "$JQ_BIN"; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "missing required tool: $bin" >&2
+    exit 1
+  fi
+done
+
+# ── Frontmatter helper ────────────────────────────────────────────────────────
+frontmatter() {
+  "$YQ_BIN" --front-matter=extract ".$1 // \"\"" "$TASK_FILE"
+}
+
+frontmatter_list() {
+  "$YQ_BIN" --front-matter=extract ".$1 // [] | .[]" "$TASK_FILE" 2>/dev/null || true
+}
+
+# ── RECORD PHASE ──────────────────────────────────────────────────────────────
+if [[ -n "$RECORD_OUTCOME" ]]; then
+  case "$RECORD_OUTCOME" in
+    pass|fail) ;;
+    *) echo "invalid --record value: $RECORD_OUTCOME (allowed: pass|fail)" >&2; exit 1 ;;
+  esac
+
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "state file not found: $STATE_FILE" >&2
+    echo "run '$0 $TASK_ID' (bundle phase) before recording outcome" >&2
+    exit 2
+  fi
+
+  GATE_START="$(cat "$STATE_FILE")"
+  GATE_END="$(date +%s)"
+  REVIEW_WALL_TIME=$(( GATE_END - GATE_START ))
+
+  if [[ ! -f "$TELEMETRY_FILE" ]]; then
+    echo "telemetry file not found: $TELEMETRY_FILE" >&2
+    exit 1
+  fi
+
+  # Update the last line matching this task_id in the JSONL file.
+  TMPFILE="$(mktemp "${TELEMETRY_FILE}.XXXXXX")"
+  LAST_MATCH_LINE=0
+  LINE_NUM=0
+  while IFS= read -r line; do
+    LINE_NUM=$(( LINE_NUM + 1 ))
+    TID="$(printf '%s' "$line" | "$JQ_BIN" -r '.task_id // ""' 2>/dev/null || echo "")"
+    if [[ "$TID" == "$TASK_ID" ]]; then
+      LAST_MATCH_LINE=$LINE_NUM
+    fi
+  done < "$TELEMETRY_FILE"
+
+  if [[ $LAST_MATCH_LINE -eq 0 ]]; then
+    echo "no telemetry line found for $TASK_ID in $TELEMETRY_FILE" >&2
+    rm -f "$TMPFILE"
+    exit 1
+  fi
+
+  LINE_NUM=0
+  while IFS= read -r line; do
+    LINE_NUM=$(( LINE_NUM + 1 ))
+    if [[ $LINE_NUM -eq $LAST_MATCH_LINE ]]; then
+      printf '%s' "$line" | "$JQ_BIN" -c \
+        --argjson wall_time "$REVIEW_WALL_TIME" \
+        --arg outcome "$RECORD_OUTCOME" \
+        '. + {cto_review_wall_time_seconds: $wall_time, cto_review_outcome: $outcome}'
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$TELEMETRY_FILE" > "$TMPFILE"
+
+  mv "$TMPFILE" "$TELEMETRY_FILE"
+  rm -f "$STATE_FILE"
+
+  echo "[$TASK_ID] telemetry updated: cto_review_wall_time_seconds=${REVIEW_WALL_TIME} cto_review_outcome=${RECORD_OUTCOME}"
+  exit 0
+fi
+
+# ── BUNDLE PHASE ──────────────────────────────────────────────────────────────
+
+# Check that a PR is recorded before emitting anything.
+PR="$(frontmatter pr)"
+if [[ -z "$PR" || "$PR" == "null" ]]; then
+  echo "[$TASK_ID] no PR recorded in frontmatter — run oc-execute.sh first" >&2
+  exit 1
+fi
+
+# Stamp the review start time for the record phase.
+date +%s > "$STATE_FILE"
+
+# ── Section separator helper ──────────────────────────────────────────────────
+hr() {
+  printf '%0.s─' {1..80}
+  printf '\n'
+}
+
+section() {
+  echo ""
+  hr
+  echo "## $1"
+  hr
+}
+
+# ── Determine current repo identifier for gh calls ───────────────────────────
+CURRENT_REPO="$(
+  "$GIT_BIN" remote get-url origin 2>/dev/null \
+    | sed 's|.*://[^/]*/||; s|\.git$||' \
+  || echo ""
+)"
+
+# ── Build bundle ──────────────────────────────────────────────────────────────
+{
+  echo "# CTO Gate Review Bundle — ${TASK_ID}"
+  echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # ── 1. TASK frontmatter ───────────────────────────────────────────────────
+  section "TASK FRONTMATTER"
+  "$YQ_BIN" --front-matter=extract '.' "$TASK_FILE"
+
+  # ── 2. Plan acceptance section ────────────────────────────────────────────
+  section "PLAN ACCEPTANCE CRITERIA"
+  if [[ -f "$PLAN_FILE" ]]; then
+    awk '/^## Acceptance$/{found=1; next} found && /^## /{exit} found{print}' "$PLAN_FILE"
+  else
+    echo "(plan file not found: ${PLAN_FILE})"
+    echo "Set PLAN_FILE env var or create docs/plans/active.md."
+  fi
+
+  # ── 3. Full git diff vs main ──────────────────────────────────────────────
+  section "FULL DIFF VS MAIN"
+  "$GIT_BIN" diff "main...HEAD" 2>/dev/null \
+    || "$GIT_BIN" diff "main..HEAD" 2>/dev/null \
+    || echo "(could not compute diff vs main)"
+
+  # ── 4. CI check summary ───────────────────────────────────────────────────
+  section "CI CHECK SUMMARY (PR #${PR})"
+  if command -v "$GH_BIN" >/dev/null 2>&1 && [[ -n "$CURRENT_REPO" ]]; then
+    "$GH_BIN" pr checks "$PR" --repo "$CURRENT_REPO" 2>/dev/null \
+      || echo "(gh pr checks failed — CI may still be running or gh is not configured)"
+  else
+    echo "(gh not available or repo remote not found)"
+  fi
+
+  # ── 5. HIGHLIGHT section: sensitive shared package changes ────────────────
+  section "HIGHLIGHT — SHARED/DB PACKAGE CHANGES"
+  echo "# Any file under packages/shared/** or packages/db/** is flagged here"
+  echo "# because these paths sit adjacent to protected package boundaries"
+  echo "# (env vars, DB schema, shared types). Verify each file listed below."
+  echo ""
+
+  SENSITIVE_FILES=()
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      packages/shared/*|packages/db/*)
+        SENSITIVE_FILES+=("$f")
+        ;;
+    esac
+  done < <("$GIT_BIN" diff --name-only "main...HEAD" 2>/dev/null || true)
+
+  if [[ ${#SENSITIVE_FILES[@]} -eq 0 ]]; then
+    echo "(none)"
+  else
+    for f in "${SENSITIVE_FILES[@]}"; do
+      echo "  FLAGGED: $f"
+    done
+    echo ""
+    echo "Review each flagged file carefully before approving:"
+    for f in "${SENSITIVE_FILES[@]}"; do
+      echo ""
+      echo "--- ${f} ---"
+      "$GIT_BIN" diff "main...HEAD" -- "$f" 2>/dev/null || true
+    done
+  fi
+
+} # end bundle
+
+echo ""
+echo "# Bundle complete. Review the above, then run:"
+echo "#   $0 $TASK_ID --record pass"
+echo "#   $0 $TASK_ID --record fail"

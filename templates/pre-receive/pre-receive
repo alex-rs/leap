@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# pre-receive/pre-receive — server-side pre-receive dispatcher.
+#
+# Called once per push by the git server. stdin contains one line per ref:
+#   <old-sha> <new-sha> <refname>
+#
+# This dispatcher reads all pushed commits, builds a list of changed files,
+# and delegates to each sub-hook in turn. A single failure from any sub-hook
+# causes the push to be rejected (exit 1). All sub-hooks run so the author
+# sees all violations in one push attempt rather than discovering them
+# one-by-one.
+#
+# Sub-hooks are sourced from the same directory as this script. They receive:
+#   - PUSHED_COMMITS array (space-separated sha list)
+#   - CHANGED_FILES array (all files changed across all commits)
+#   - COMMIT_MESSAGES array (one entry per commit)
+#   - PUSH_OLDSHA / PUSH_NEWSHA / PUSH_REFNAME for the last ref (primary ref)
+#   - GIT_DIR is set by the git server to the bare repo path
+#
+# Any sub-hook that finds a violation must print a human-readable message to
+# stderr and exit 1. The dispatcher collects the exit code and continues
+# running remaining hooks.
+
+set -uo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+GIT_BIN="${GIT_BIN:-git}"
+
+# ------------------------------------------------------------------
+# Collect all pushed refs from stdin
+# ------------------------------------------------------------------
+declare -a PUSHED_COMMITS=()
+declare -a COMMIT_MESSAGES=()
+declare -a ALL_CHANGED_FILES=()
+
+PUSH_OLDSHA=""
+PUSH_NEWSHA=""
+PUSH_REFNAME=""
+
+while IFS=" " read -r OLD NEW REF; do
+  PUSH_OLDSHA="$OLD"
+  PUSH_NEWSHA="$NEW"
+  PUSH_REFNAME="$REF"
+
+  # Skip branch deletions (new sha is all-zeros)
+  if [[ "$NEW" =~ ^0+$ ]]; then
+    continue
+  fi
+
+  # Range: if old is all-zeros this is a new branch; use empty tree as base.
+  EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+  if [[ "$OLD" =~ ^0+$ ]]; then
+    RANGE="${EMPTY_TREE}..${NEW}"
+  else
+    RANGE="${OLD}..${NEW}"
+  fi
+
+  # Collect commits in this push
+  while IFS= read -r SHA; do
+    [[ -z "$SHA" ]] && continue
+    PUSHED_COMMITS+=("$SHA")
+    MSG=$($GIT_BIN log -1 --format='%B' "$SHA" 2>/dev/null || true)
+    COMMIT_MESSAGES+=("$MSG")
+  done < <($GIT_BIN rev-list "$RANGE" 2>/dev/null || true)
+
+  # Collect changed files
+  while IFS= read -r FILE; do
+    [[ -z "$FILE" ]] && continue
+    ALL_CHANGED_FILES+=("$FILE")
+  done < <($GIT_BIN diff --name-only "${RANGE}" 2>/dev/null || true)
+done
+
+export PUSH_OLDSHA PUSH_NEWSHA PUSH_REFNAME
+
+# ------------------------------------------------------------------
+# Run each sub-hook in order
+# ------------------------------------------------------------------
+OVERALL_EXIT=0
+
+run_hook() {
+  local hook_name="$1"
+  local hook_path="${HOOK_DIR}/${hook_name}"
+
+  if [[ ! -x "$hook_path" ]]; then
+    echo "[pre-receive] WARNING: hook not found or not executable: ${hook_name}" >&2
+    return 0
+  fi
+
+  # Pass context via environment arrays serialized as NUL-delimited strings
+  # in temp files. Hooks read these files directly.
+  local tmp_commits tmp_files tmp_messages
+  tmp_commits=$(mktemp)
+  tmp_files=$(mktemp)
+  tmp_messages=$(mktemp)
+
+  printf '%s\n' "${PUSHED_COMMITS[@]+"${PUSHED_COMMITS[@]}"}" > "$tmp_commits"
+  printf '%s\n' "${ALL_CHANGED_FILES[@]+"${ALL_CHANGED_FILES[@]}"}" > "$tmp_files"
+  printf '%s\0' "${COMMIT_MESSAGES[@]+"${COMMIT_MESSAGES[@]}"}" > "$tmp_messages"
+
+  export HOOK_COMMITS_FILE="$tmp_commits"
+  export HOOK_FILES_FILE="$tmp_files"
+  export HOOK_MESSAGES_FILE="$tmp_messages"
+
+  if ! bash "$hook_path" >&2; then
+    echo "[pre-receive] BLOCKED by hook: ${hook_name}" >&2
+    OVERALL_EXIT=1
+  fi
+
+  rm -f "$tmp_commits" "$tmp_files" "$tmp_messages"
+}
+
+run_hook "forbidden-tokens.sh"
+run_hook "gitleaks.sh"
+run_hook "lockfile-drift.sh"
+run_hook "protected-paths.sh"
+run_hook "waiver-schema.sh"
+run_hook "test-deletion.sh"
+
+if [[ $OVERALL_EXIT -ne 0 ]]; then
+  echo "" >&2
+  echo "[pre-receive] Push REJECTED. Fix all violations above and push again." >&2
+fi
+
+exit $OVERALL_EXIT

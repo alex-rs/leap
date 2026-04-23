@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# pre-receive/install.sh — idempotent pre-receive hook installer.
+#
+# Installs the pre-receive hook suite into a git repository's hooks directory.
+# Safe to run multiple times (idempotent): overwrites hooks in place, does not
+# create duplicates.
+#
+# Usage:
+#   pre-receive/install.sh [OPTIONS]
+#
+# Options:
+#   --container NAME   Docker container name for the git server (default: %%PROJECT_NAME%%-gitea)
+#   --org      ORG     Git org/user that owns the repo (default: %%ADMIN_USERNAME%%)
+#   --repo     REPO    Repository name (default: %%PROJECT_NAME%%)
+#   --url      URL     Git server base URL for health check (default: http://localhost:3000)
+#   --dry-run          Print what would be done without making changes
+#
+# What this script does:
+#   1. Verifies the git server container is running.
+#   2. Locates the bare repo's hooks directory inside the container at
+#      /data/gitea/repositories/<org>/<repo>.git/hooks/
+#   3. Copies all *.sh files from pre-receive/ into the hooks dir.
+#   4. Writes a pre-receive dispatcher that sources the hook suite dir.
+#   5. Makes all hooks executable.
+#
+# Idempotency: hooks are overwritten on each run. The pre-receive dispatcher
+# is always replaced with the current version. No state accumulates.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HOOK_SRC_DIR="${SCRIPT_DIR}"
+
+# ------------------------------------------------------------------
+# Defaults (overridable via env or CLI)
+# ------------------------------------------------------------------
+GITEA_CONTAINER="${GITEA_CONTAINER:-%%PROJECT_NAME%%-gitea}"
+GITEA_ORG="${GITEA_ORG:-%%ADMIN_USERNAME%%}"
+GITEA_REPO="${GITEA_REPO:-%%PROJECT_NAME%%}"
+GITEA_URL="${GITEA_URL:-http://localhost:3000}"
+DRY_RUN=false
+
+# ------------------------------------------------------------------
+# Argument parsing
+# ------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --container) GITEA_CONTAINER="$2"; shift 2 ;;
+    --org)       GITEA_ORG="$2";       shift 2 ;;
+    --repo)      GITEA_REPO="$2";      shift 2 ;;
+    --url)       GITEA_URL="$2";       shift 2 ;;
+    --dry-run)   DRY_RUN=true;         shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+# ------------------------------------------------------------------
+# Input validation: GITEA_ORG and GITEA_REPO are interpolated into
+# docker exec and sed commands inside the container. Reject values
+# that contain characters outside [a-zA-Z0-9_-] to prevent injection.
+# ------------------------------------------------------------------
+_SAFE_PATTERN='^[a-zA-Z0-9_-]+$'
+if ! printf '%s' "${GITEA_ORG}" | grep -qE "${_SAFE_PATTERN}"; then
+  echo "[install] ERROR: --org contains unsafe characters: '${GITEA_ORG}'" >&2
+  echo "[install] Only [a-zA-Z0-9_-] characters are allowed." >&2
+  exit 1
+fi
+if ! printf '%s' "${GITEA_REPO}" | grep -qE "${_SAFE_PATTERN}"; then
+  echo "[install] ERROR: --repo contains unsafe characters: '${GITEA_REPO}'" >&2
+  echo "[install] Only [a-zA-Z0-9_-] characters are allowed." >&2
+  exit 1
+fi
+
+HOOKS_CONTAINER_PATH="/data/gitea/repositories/${GITEA_ORG}/${GITEA_REPO}.git/hooks"
+
+echo "[install] Pre-receive hook installer"
+echo "[install] Source dir:  ${HOOK_SRC_DIR}"
+echo "[install] Container:   ${GITEA_CONTAINER}"
+echo "[install] Target:      ${GITEA_CONTAINER}:${HOOKS_CONTAINER_PATH}"
+$DRY_RUN && echo "[install] DRY RUN — no changes will be made."
+
+# ------------------------------------------------------------------
+# Step 1: Verify git server container is running
+# ------------------------------------------------------------------
+echo "[install] Checking git server container health..."
+if ! docker inspect --format='{{.State.Running}}' "${GITEA_CONTAINER}" 2>/dev/null | grep -q true; then
+  echo "[install] ERROR: Container '${GITEA_CONTAINER}' is not running." >&2
+  echo "[install] Start the development stack first." >&2
+  exit 1
+fi
+
+# Verify server responds.
+if ! curl -sf "${GITEA_URL}/api/healthz" >/dev/null 2>&1; then
+  echo "[install] ERROR: Git server at ${GITEA_URL} is not responding." >&2
+  exit 1
+fi
+echo "[install] Git server is healthy."
+
+# ------------------------------------------------------------------
+# Step 2: Verify the repository exists in the container
+# ------------------------------------------------------------------
+echo "[install] Verifying repository exists: ${GITEA_ORG}/${GITEA_REPO}..."
+if ! docker exec "${GITEA_CONTAINER}" test -d "${HOOKS_CONTAINER_PATH}" 2>/dev/null; then
+  echo "[install] ERROR: Hooks directory not found: ${HOOKS_CONTAINER_PATH}" >&2
+  echo "[install] Has the repo been created? Create the repository first." >&2
+  exit 1
+fi
+echo "[install] Repository hooks directory found."
+
+if $DRY_RUN; then
+  echo "[install] DRY RUN: would install hooks from ${HOOK_SRC_DIR}/ to ${HOOKS_CONTAINER_PATH}/"
+  ls -la "${HOOK_SRC_DIR}/"*.sh 2>/dev/null || true
+  echo "[install] DRY RUN complete."
+  exit 0
+fi
+
+# ------------------------------------------------------------------
+# Step 3: Copy hook suite scripts into the container hooks dir
+# ------------------------------------------------------------------
+echo "[install] Installing hook scripts..."
+
+# Create a hooks/suite/ subdirectory inside the container for the sub-hooks.
+SUITE_CONTAINER_PATH="${HOOKS_CONTAINER_PATH}/suite"
+docker exec "${GITEA_CONTAINER}" mkdir -p "${SUITE_CONTAINER_PATH}"
+
+for HOOK_FILE in "${HOOK_SRC_DIR}"/*.sh; do
+  BASENAME=$(basename "$HOOK_FILE")
+  echo "[install]   Copying ${BASENAME}..."
+  docker cp "${HOOK_FILE}" "${GITEA_CONTAINER}:${SUITE_CONTAINER_PATH}/${BASENAME}"
+  docker exec "${GITEA_CONTAINER}" chmod +x "${SUITE_CONTAINER_PATH}/${BASENAME}"
+done
+
+# ------------------------------------------------------------------
+# Step 4: Write the pre-receive dispatcher that delegates to the suite.
+#
+# Note: the pre-receive file at pre-receive/pre-receive is the
+# dispatcher. Copy it directly (not into suite/).
+# ------------------------------------------------------------------
+echo "[install] Installing pre-receive dispatcher..."
+docker cp "${HOOK_SRC_DIR}/pre-receive" "${GITEA_CONTAINER}:${HOOKS_CONTAINER_PATH}/pre-receive"
+docker exec "${GITEA_CONTAINER}" chmod +x "${HOOKS_CONTAINER_PATH}/pre-receive"
+
+# The sub-hooks are referenced by the dispatcher using HOOK_DIR.
+# Patch HOOK_DIR in the installed dispatcher to point to
+# the suite directory inside the container.
+docker exec "${GITEA_CONTAINER}" sed -i \
+  "s|HOOK_DIR=\"\$(cd \"\$(dirname \"\$0\")\" && pwd)\"|HOOK_DIR=\"${SUITE_CONTAINER_PATH}\"|" \
+  "${HOOKS_CONTAINER_PATH}/pre-receive"
+
+echo "[install] Verifying permissions..."
+docker exec "${GITEA_CONTAINER}" ls -la "${HOOKS_CONTAINER_PATH}/"
+docker exec "${GITEA_CONTAINER}" ls -la "${SUITE_CONTAINER_PATH}/"
+
+echo ""
+echo "[install] Done. Pre-receive hooks installed successfully."
+echo "[install] Test: attempt a push with a forbidden token to verify enforcement."

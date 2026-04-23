@@ -1,0 +1,5 @@
+.claude/
+.codex
+*.swp
+*.swo
+.DS_Store

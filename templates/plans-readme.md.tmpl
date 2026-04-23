@@ -1,0 +1,58 @@
+# Plans
+
+A plan is a narrative document. Tasks under `docs/backlog/` are the mechanical units. Plans link to task IDs; tasks do not own narrative.
+
+## When CTO writes a plan
+
+- Any founder request that will take ≥3 discrete tasks.
+- Any founder request that touches multiple subagents.
+- Any work that crosses a phase boundary.
+- Any work that will require modifying a protected path.
+
+One-shot fixes (≤2 tasks, single subagent, no protected-path touch) may skip the plan and go straight to a task file.
+
+## File name
+
+`docs/plans/YYYY-MM-DD-<kebab-slug>.md`. Date is the day the plan is written, not the deadline. Slug is the core verb or noun (e.g. `2026-04-22-webhook-hardening.md`, `2026-05-03-phase-1-cutover.md`).
+
+## Frontmatter
+
+```yaml
+---
+slug: <kebab-slug>
+status: draft | active | completed | abandoned
+created: <YYYY-MM-DD>
+founder_approved: null        # ISO date when founder signs off; null blocks delegation
+founder_approved_by: null     # set to founder identifier on approval
+tasks: []                     # populated once tasks are filed under docs/backlog/
+supersedes: null              # slug of a plan this replaces, if any
+---
+```
+
+- `status: draft` — CTO is drafting, founder has not approved. No delegation.
+- `status: active` — founder approved, CTO is delegating against `tasks`. Only one plan may be `active` per scope at a time (so stale plans get closed before a new one opens).
+- `status: completed` — every listed task is `done` in the backlog.
+- `status: abandoned` — founder pivoted or plan was superseded.
+
+## Body sections
+
+1. **Goal** — one paragraph. What "done" looks like.
+2. **Non-goals** — what this plan does NOT solve. Prevents scope creep when tasks fan out.
+3. **Constraints** — deadlines, budget, external dependencies, licensing notes.
+4. **Approach** — high-level shape of the solution. Two to five paragraphs.
+5. **Task breakdown** — numbered list of intended tasks, each with a one-line summary and proposed owner. Task files are filed after founder approval.
+6. **Risks** — known ways this can go sideways; who owns each risk.
+7. **Acceptance** — observable signals that the plan is complete (e.g., "webhook replay test green in CI", "no duplicate charges in staging for 48h").
+
+## Founder-approval gate
+
+CTO writes the plan with `founder_approved: null` and asks the founder to review. **Nothing may be delegated until `founder_approved` is set to an ISO date and `founder_approved_by` is set.** This is the one mandatory human checkpoint before work begins.
+
+On approval, CTO flips `status: draft → active`, files the task files referenced in `tasks:`, and begins delegation.
+
+## Closing a plan
+
+- `completed`: when every task in `tasks:` is `done` in the backlog (verified, merged, ci-gatekeeper approved).
+- `abandoned`: when the founder signals a pivot. Any `doing` tasks flip to `blocked` with `blocked_reason: plan-abandoned`. The plan file stays; its `status` moves to `abandoned` with a short retro paragraph appended.
+
+Completed and abandoned plans are never deleted. They become the institutional memory of %%PROJECT_NAME%%.

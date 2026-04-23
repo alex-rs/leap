@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# checks/post-approved-check.sh — post the ci-gatekeeper/approved required check.
+#
+# Only ci-gatekeeper may call this script with a valid GH_TOKEN.
+# Any other caller will lack the token or will have it rejected by GitHub's
+# branch protection (the check must originate from the ci-gatekeeper identity).
+#
+# Usage:
+#   post-approved-check.sh <commit_sha> <state> [<description>] [<target_url>]
+#
+#   state: success | failure | error | pending
+#
+# Env vars:
+#   GH_TOKEN  — REQUIRED; ci-gatekeeper's GitHub token
+#   GH_REPO   — repository in owner/name format (default: $GITHUB_REPOSITORY)
+#
+# Exit codes:
+#   0 — status posted successfully
+#   1 — invocation error
+#   2 — API call failed
+
+set -euo pipefail
+
+GH_REPO="${GH_REPO:-${GITHUB_REPOSITORY:-}}"
+GH_TOKEN="${GH_TOKEN:-}"
+
+COMMIT_SHA="${1:-}"
+STATE="${2:-}"
+DESCRIPTION="${3:-}"
+TARGET_URL="${4:-}"
+
+if [[ -z "${COMMIT_SHA}" || -z "${STATE}" ]]; then
+  echo "usage: $0 <commit_sha> <state> [description] [target_url]" >&2
+  exit 1
+fi
+
+if [[ -z "${GH_TOKEN}" ]]; then
+  echo "ERROR: GH_TOKEN is not set. Only ci-gatekeeper may post the approved check." >&2
+  exit 1
+fi
+
+if [[ -z "${GH_REPO}" ]]; then
+  echo "ERROR: GH_REPO is not set. Set GH_REPO=owner/repo or GITHUB_REPOSITORY." >&2
+  exit 1
+fi
+
+case "${STATE}" in
+  success|failure|error|pending) ;;
+  *)
+    echo "ERROR: invalid state '${STATE}'; must be success|failure|error|pending" >&2
+    exit 1
+    ;;
+esac
+
+# Default descriptions by state
+if [[ -z "${DESCRIPTION}" ]]; then
+  case "${STATE}" in
+    success) DESCRIPTION="All guardrails satisfied. PR is clear to merge." ;;
+    failure) DESCRIPTION="One or more guardrail violations detected. See ci-gatekeeper comment." ;;
+    error)   DESCRIPTION="ci-gatekeeper encountered an internal error. Investigate before merging." ;;
+    pending) DESCRIPTION="ci-gatekeeper review in progress." ;;
+  esac
+fi
+
+PAYLOAD="$(python3 -c "
+import json, sys
+d = {
+    'state': sys.argv[1],
+    'context': 'ci-gatekeeper/approved',
+    'description': sys.argv[2][:255],
+}
+if sys.argv[3]:
+    d['target_url'] = sys.argv[3]
+print(json.dumps(d))
+" "${STATE}" "${DESCRIPTION}" "${TARGET_URL}")"
+
+RESP_FILE="$(mktemp)"
+trap 'rm -f "$RESP_FILE"' EXIT
+
+HTTP_CODE="$(curl -s -o "$RESP_FILE" -w "%{http_code}" \
+  -H "Authorization: token ${GH_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -X POST "https://api.github.com/repos/${GH_REPO}/statuses/${COMMIT_SHA}" \
+  -d "${PAYLOAD}")"
+
+if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
+  echo "[post-approved] state=${STATE} commit=${COMMIT_SHA} posted successfully (HTTP ${HTTP_CODE})"
+  exit 0
+else
+  echo "[post-approved] ERROR: API returned HTTP ${HTTP_CODE}" >&2
+  cat "$RESP_FILE" >&2
+  exit 2
+fi

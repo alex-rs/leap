@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+#
+# oc-execute.sh TASK-NNN [--type feat|fix|chore]
+#
+# Dispatcher that orchestrates opencode execution for a single task:
+#   1. Acquires an exclusive lock — only one run at a time.
+#   2. Runs eligibility prechecks (owner restriction, protected-path intersection,
+#      depends_on gate, acceptance-criteria greppability).
+#   3. Runs scope check (diff vs files_allowlist / must_not_touch) before lint/test.
+#   4. Invokes opencode with --dangerously-skip-permissions inside a 30-min wall-clock cap.
+#   5. On success: templates commit message, writes commit+pr into TASK frontmatter,
+#      waits for CI with a 15-min cap.
+#   6. Always appends one telemetry line to ops/telemetry/opencode-spend.jsonl.
+#
+# Exit codes:
+#   0   — task executed successfully; CI green; frontmatter written
+#   1   — invocation error (bad args, missing tools, missing task file)
+#   2   — eligibility precheck failed
+#   3   — scope violation (diff outside allowlist or touching must_not_touch)
+#   4   — opencode execution failed (non-zero exit inside budget)
+#   5   — CI failed or ci-gatekeeper/approved not green
+#   75  — lock contention (another run holds the lock)
+#   124 — wall-clock cap exceeded (timeout)
+
+set -euo pipefail
+
+# ── Binary overrides (set in tests to inject fakes) ───────────────────────────
+: "${OPENCODE_BIN:=opencode}"
+: "${GH_BIN:=gh}"
+: "${YQ_BIN:=yq}"
+if [[ -z "${FLOCK_BIN:-}" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    FLOCK_BIN="$(brew --prefix 2>/dev/null)/opt/util-linux/bin/flock"
+  else
+    FLOCK_BIN="$(command -v flock 2>/dev/null || echo flock)"
+  fi
+fi
+: "${GIT_BIN:=git}"
+: "${RG_BIN:=rg}"
+
+# ── Repository root ────────────────────────────────────────────────────────────
+REPO_ROOT="$("$GIT_BIN" rev-parse --show-toplevel)"
+
+# ── Task directory (override in tests) ────────────────────────────────────────
+: "${TASK_DIR:=${REPO_ROOT}/docs/backlog}"
+
+# ── Telemetry file ────────────────────────────────────────────────────────────
+TELEMETRY_FILE="${REPO_ROOT}/ops/telemetry/opencode-spend.jsonl"
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+TASK_ID=""
+COMMIT_TYPE="feat"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type)
+      shift
+      COMMIT_TYPE="${1:-feat}"
+      ;;
+    TASK-*)
+      TASK_ID="$1"
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      echo "usage: $0 TASK-NNN [--type feat|fix|chore]" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "usage: $0 TASK-NNN [--type feat|fix|chore]" >&2
+  exit 1
+fi
+
+if [[ ! "$TASK_ID" =~ ^TASK-[A-Z0-9-]+$ ]]; then
+  echo "invalid TASK_ID format: $TASK_ID" >&2
+  exit 1
+fi
+
+case "$COMMIT_TYPE" in
+  feat|fix|chore|docs|test|refactor) ;;
+  *) echo "invalid --type: $COMMIT_TYPE (allowed: feat|fix|chore|docs|test|refactor)" >&2; exit 1 ;;
+esac
+
+TASK_FILE="${TASK_DIR}/${TASK_ID}.md"
+
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "task file not found: $TASK_FILE" >&2
+  exit 1
+fi
+
+# ── Tool checks ───────────────────────────────────────────────────────────────
+for bin in "$YQ_BIN" "$RG_BIN" "$GIT_BIN" "$OPENCODE_BIN"; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "missing required tool: $bin" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -x "$FLOCK_BIN" ]]; then
+  echo "flock not found or not executable: $FLOCK_BIN" >&2
+  exit 1
+fi
+
+# ── Telemetry state ───────────────────────────────────────────────────────────
+TELEMETRY_STATUS="unknown"
+TELEMETRY_ITERATIONS=0
+TELEMETRY_TOKENS_IN=0
+TELEMETRY_TOKENS_OUT=0
+WALL_START="$(date +%s)"
+
+append_telemetry() {
+  local wall_end
+  wall_end="$(date +%s)"
+  local wall_time=$(( wall_end - WALL_START ))
+  mkdir -p "$(dirname "$TELEMETRY_FILE")"
+  printf '{"task_id":"%s","model":"opencode/default","iterations":%d,"opencode_tokens_in":%d,"opencode_tokens_out":%d,"wall_time_seconds":%d,"status":"%s"}\n' \
+    "$TASK_ID" \
+    "$TELEMETRY_ITERATIONS" \
+    "$TELEMETRY_TOKENS_IN" \
+    "$TELEMETRY_TOKENS_OUT" \
+    "$wall_time" \
+    "$TELEMETRY_STATUS" \
+    >> "$TELEMETRY_FILE"
+}
+
+trap 'append_telemetry' EXIT
+
+# ── Acquire exclusive lock ────────────────────────────────────────────────────
+LOCK_DIR="${XDG_RUNTIME_DIR:-${HOME}/.%%PROJECT_NAME%%/locks}"
+mkdir -p "$LOCK_DIR"
+chmod 0700 "$LOCK_DIR"
+LOCK_FILE="${LOCK_DIR}/opencode.lock"
+if [[ -L "$LOCK_FILE" ]]; then
+  echo "lock file is a symlink — aborting for safety: $LOCK_FILE" >&2
+  exit 1
+fi
+exec 200>"$LOCK_FILE"
+set +e
+"$FLOCK_BIN" -n -x 200
+FLOCK_EXIT=$?
+set -e
+if [[ $FLOCK_EXIT -ne 0 ]]; then
+  echo "another oc-execute.sh run holds $LOCK_FILE; aborting" >&2
+  TELEMETRY_STATUS="lock_contention"
+  exit 75
+fi
+
+# ── Frontmatter helpers ───────────────────────────────────────────────────────
+frontmatter() {
+  "$YQ_BIN" --front-matter=extract ".$1 // \"\"" "$TASK_FILE"
+}
+
+frontmatter_list() {
+  "$YQ_BIN" --front-matter=extract ".$1 // [] | .[]" "$TASK_FILE" 2>/dev/null || true
+}
+
+# ── Read task metadata ────────────────────────────────────────────────────────
+TASK_TITLE="$(frontmatter title | tr -d '\n')"
+TASK_OWNER="$(frontmatter owner)"
+
+DEPENDS_ON=()
+while IFS= read -r line; do [[ -n "$line" ]] && DEPENDS_ON+=("$line"); done \
+  < <(frontmatter_list depends_on)
+
+FILES_ALLOWLIST=()
+while IFS= read -r line; do [[ -n "$line" ]] && FILES_ALLOWLIST+=("$line"); done \
+  < <(frontmatter_list files_allowlist)
+
+MUST_NOT_TOUCH=()
+while IFS= read -r line; do [[ -n "$line" ]] && MUST_NOT_TOUCH+=("$line"); done \
+  < <(frontmatter_list must_not_touch)
+
+ACCEPTANCE_CRITERIA=()
+while IFS= read -r line; do [[ -n "$line" ]] && ACCEPTANCE_CRITERIA+=("$line"); done \
+  < <(frontmatter_list acceptance_criteria)
+
+# ── Protected paths (enforced by precheck, not this task's own must_not_touch) ─
+PROTECTED_PATHS=(
+  "ops/pre-receive/**"
+  "pre-receive/**"
+  "docs/waivers.yaml"
+  "coverage/baseline.json"
+  "knip.baseline.json"
+  "CLAUDE.md"
+  "docs/cto.md"
+  ".claude/agents/**"
+  ".claude/skills/**"
+  ".github/workflows/**"
+  ".gitea/workflows/**"
+)
+
+# ── Restricted owners ─────────────────────────────────────────────────────────
+RESTRICTED_OWNERS=("security-engineer" "ci-gatekeeper" "billing-engineer")
+
+# ── ELIGIBILITY PRECHECK ─────────────────────────────────────────────────────
+PRECHECK_FAILED=0
+
+precheck_fail() {
+  echo "PRECHECK FAIL [$TASK_ID]: $*" >&2
+  PRECHECK_FAILED=1
+}
+
+# 1. Owner restriction
+for restricted in "${RESTRICTED_OWNERS[@]}"; do
+  if [[ "$TASK_OWNER" == "$restricted" ]]; then
+    precheck_fail "owner '$TASK_OWNER' is in the restricted set {security-engineer, ci-gatekeeper, billing-engineer}"
+    break
+  fi
+done
+
+# 2. files_allowlist ∩ protected paths
+paths_overlap() {
+  local a="$1"
+  local b="$2"
+  local a_prefix="${a%%\*\*}" a_prefix2="${a%%\*}"
+  local b_prefix="${b%%\*\*}" b_prefix2="${b%%\*}"
+
+  [[ -z "$a_prefix" ]] && a_prefix="$a_prefix2"
+  [[ -z "$b_prefix" ]] && b_prefix="$b_prefix2"
+
+  local a_base="${a_prefix%/}"
+  local b_base="${b_prefix%/}"
+
+  [[ -z "$a_base" ]] && return 0
+  [[ -z "$b_base" ]] && return 0
+
+  case "$a_base" in
+    "$b_base") return 0 ;;
+    ${b_base}/*) return 0 ;;
+  esac
+  case "$b_base" in
+    ${a_base}/*) return 0 ;;
+  esac
+
+  case "$a" in
+    $b) return 0 ;;
+  esac
+  case "$b" in
+    $a) return 0 ;;
+  esac
+
+  return 1
+}
+
+for allowed in "${FILES_ALLOWLIST[@]+"${FILES_ALLOWLIST[@]}"}"; do
+  for protected in "${PROTECTED_PATHS[@]}"; do
+    if paths_overlap "$allowed" "$protected"; then
+      precheck_fail "files_allowlist entry '$allowed' overlaps protected path '$protected'"
+    fi
+  done
+done
+
+# 3. depends_on tasks must all be done
+for dep in "${DEPENDS_ON[@]+"${DEPENDS_ON[@]}"}"; do
+  dep_file="${TASK_DIR}/${dep}.md"
+  if [[ ! -f "$dep_file" ]]; then
+    precheck_fail "depends_on task '$dep' file not found"
+    continue
+  fi
+  dep_status="$("$YQ_BIN" --front-matter=extract ".status // \"\"" "$dep_file")"
+  if [[ "$dep_status" != "done" ]]; then
+    precheck_fail "depends_on task '$dep' has status '$dep_status', expected 'done'"
+  fi
+done
+
+# 4. Greppability of path-like tokens in acceptance_criteria backtick spans
+is_path_like_token() {
+  local token="$1"
+  [[ "$token" =~ [/\.] ]] || return 1
+  [[ "$token" =~ ^- ]] && return 1
+  [[ "$token" =~ ^/tmp/ ]] && return 1
+  [[ "$token" =~ \* ]] && return 1
+  return 0
+}
+
+for criterion in "${ACCEPTANCE_CRITERIA[@]+"${ACCEPTANCE_CRITERIA[@]}"}"; do
+  while IFS= read -r span; do
+    [[ -z "$span" ]] && continue
+    for token in $span; do
+      if is_path_like_token "$token"; then
+        if ! "$RG_BIN" -q --fixed-strings "$token" \
+            "${REPO_ROOT}/apps" "${REPO_ROOT}/packages" "${REPO_ROOT}/docs" 2>/dev/null; then
+          precheck_fail "acceptance criterion token '$token' (in backtick span '$span') not found under apps/, packages/, or docs/"
+        fi
+      fi
+    done
+  done < <(printf '%s\n' "$criterion" | "$RG_BIN" -o '`[^`]+`' | sed 's/`//g')
+done
+
+if [[ $PRECHECK_FAILED -ne 0 ]]; then
+  TELEMETRY_STATUS="ineligible"
+  exit 2
+fi
+
+# ── SCOPE CHECK helper ────────────────────────────────────────────────────────
+PRE_EXISTING_UNTRACKED=""
+
+snapshot_pre_existing_untracked() {
+  PRE_EXISTING_UNTRACKED="$("$GIT_BIN" ls-files --others --exclude-standard 2>/dev/null | sort)"
+}
+
+run_scope_check() {
+  local committed_changes unstaged_changes new_untracked diff_files
+  committed_changes="$("$GIT_BIN" diff --name-only "$INITIAL_HEAD" HEAD 2>/dev/null || true)"
+  unstaged_changes="$("$GIT_BIN" diff --name-only HEAD 2>/dev/null || true)"
+  new_untracked="$(comm -23 \
+    <("$GIT_BIN" ls-files --others --exclude-standard 2>/dev/null | sort) \
+    <(echo "$PRE_EXISTING_UNTRACKED") \
+  )"
+  diff_files="$(printf '%s\n%s\n%s\n' "$committed_changes" "$unstaged_changes" "$new_untracked" | sort -u)"
+  [[ -z "$diff_files" || "$diff_files" == $'\n' ]] && return 0
+
+  local scope_ok=0
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    local matched=0
+    for glob in "${FILES_ALLOWLIST[@]+"${FILES_ALLOWLIST[@]}"}"; do
+      case "$f" in
+        $glob) matched=1; break ;;
+      esac
+    done
+    if [[ $matched -eq 0 ]]; then
+      echo "SCOPE VIOLATION [$TASK_ID]: '$f' is outside files_allowlist" >&2
+      scope_ok=1
+    fi
+    for glob in "${MUST_NOT_TOUCH[@]+"${MUST_NOT_TOUCH[@]}"}"; do
+      case "$f" in
+        $glob)
+          echo "SCOPE VIOLATION [$TASK_ID]: '$f' touches must_not_touch ($glob)" >&2
+          scope_ok=1
+          break
+          ;;
+      esac
+    done
+  done <<<"$diff_files"
+
+  return $scope_ok
+}
+
+# ── MAIN EXECUTION LOOP ───────────────────────────────────────────────────────
+snapshot_pre_existing_untracked
+INITIAL_HEAD="$("$GIT_BIN" rev-parse HEAD)"
+MAX_ITERATIONS=5
+iteration=0
+OPENCODE_EXIT=0
+
+while [[ $iteration -lt $MAX_ITERATIONS ]]; do
+  iteration=$(( iteration + 1 ))
+  TELEMETRY_ITERATIONS=$iteration
+
+  echo "[$TASK_ID] iteration $iteration of $MAX_ITERATIONS" >&2
+
+  OPENCODE_OUTPUT_FILE="$(mktemp /tmp/oc-execute-output.XXXXXX)"
+  OPENCODE_PROMPT="Execute the following task completely. Do NOT author the commit message — the dispatcher will template it. Do NOT push — the dispatcher handles push and PR. Task file: ${TASK_FILE}"
+
+  set +e
+  timeout 1800 "$OPENCODE_BIN" run \
+    --dangerously-skip-permissions \
+    "$OPENCODE_PROMPT" \
+    > "$OPENCODE_OUTPUT_FILE" 2>&1
+  OPENCODE_EXIT=$?
+  set -e
+
+  rm -f "$OPENCODE_OUTPUT_FILE"
+
+  if [[ $OPENCODE_EXIT -eq 124 ]]; then
+    echo "[$TASK_ID] 30-min wall-clock cap exceeded" >&2
+    TELEMETRY_STATUS="wall_timeout"
+    exit 124
+  fi
+
+  # Scope check BEFORE lint/test
+  if ! run_scope_check; then
+    echo "[$TASK_ID] scope violation on iteration $iteration; aborting" >&2
+    TELEMETRY_STATUS="scope_violation"
+    exit 3
+  fi
+
+  if [[ $OPENCODE_EXIT -eq 0 ]]; then
+    break
+  fi
+
+  echo "[$TASK_ID] opencode exited $OPENCODE_EXIT on iteration $iteration" >&2
+  if [[ $iteration -ge $MAX_ITERATIONS ]]; then
+    echo "[$TASK_ID] max iterations reached; failing" >&2
+    TELEMETRY_STATUS="failed"
+    exit 4
+  fi
+done
+
+if [[ $OPENCODE_EXIT -ne 0 ]]; then
+  TELEMETRY_STATUS="failed"
+  exit 4
+fi
+
+# ── COMMIT ────────────────────────────────────────────────────────────────────
+COMMIT_MSG="${COMMIT_TYPE}: ${TASK_ID} ${TASK_TITLE}"
+for glob in "${FILES_ALLOWLIST[@]+"${FILES_ALLOWLIST[@]}"}"; do
+  "$GIT_BIN" add -- "$glob" 2>/dev/null || true
+done
+"$GIT_BIN" -c user.name="%%BOT_USERNAME%%" -c user.email="%%BOT_USERNAME%%@%%PROJECT_NAME%%" \
+  commit -m "$COMMIT_MSG"
+
+COMMIT_HASH="$("$GIT_BIN" rev-parse HEAD)"
+
+# ── PUSH & CREATE PR ─────────────────────────────────────────────────────────
+BRANCH="$("$GIT_BIN" rev-parse --abbrev-ref HEAD)"
+
+"$GIT_BIN" push origin "$BRANCH"
+
+CURRENT_REPO="$("$GIT_BIN" remote get-url origin | "$RG_BIN" -o '[^/]+/[^/.]+(?:\.git)?$' | sed 's/\.git$//')"
+PR_JSON="$("$GH_BIN" pr create \
+  --repo "$CURRENT_REPO" \
+  --base main \
+  --head "$BRANCH" \
+  --title "${COMMIT_MSG}" \
+  --body "Automated PR from oc-execute.sh for ${TASK_ID}" \
+  --json url 2>/dev/null || echo "{}")"
+PR_URL="$(printf '%s' "$PR_JSON" | "$YQ_BIN" -r '.url // ""' 2>/dev/null || echo "")"
+
+if [[ -z "$PR_URL" ]]; then
+  echo "[$TASK_ID] failed to create PR via gh" >&2
+  TELEMETRY_STATUS="pr_failed"
+  exit 4
+fi
+
+PR_NUMBER="$(printf '%s' "$PR_URL" | "$RG_BIN" -o '[0-9]+$' || echo "")"
+
+# ── FRONTMATTER WRITEBACK (before CI check) ───────────────────────────────────
+"$YQ_BIN" --front-matter=process -i \
+  ".commit = \"${COMMIT_HASH}\" | .pr = \"${PR_NUMBER}\"" \
+  "$TASK_FILE"
+
+# Commit the writeback separately
+"$GIT_BIN" -c user.name="%%BOT_USERNAME%%" -c user.email="%%BOT_USERNAME%%@%%PROJECT_NAME%%" \
+  add "$TASK_FILE"
+"$GIT_BIN" -c user.name="%%BOT_USERNAME%%" -c user.email="%%BOT_USERNAME%%@%%PROJECT_NAME%%" \
+  commit -m "chore: ${TASK_ID} writeback commit+pr into frontmatter"
+
+"$GIT_BIN" push origin "$BRANCH"
+
+# ── CI WATCH ─────────────────────────────────────────────────────────────────
+set +e
+timeout 900 "$GH_BIN" pr checks "$PR_NUMBER" --watch --repo "$CURRENT_REPO" 2>/dev/null
+CI_WAIT_EXIT=$?
+set -e
+
+if [[ $CI_WAIT_EXIT -eq 124 ]]; then
+  echo "[$TASK_ID] 15-min CI cap exceeded; emitting ci_timeout" >&2
+  TELEMETRY_STATUS="ci_timeout"
+
+  printf '{"task_id":"%s","status":"ci_timeout","pr":"%s","commit":"%s"}\n' \
+    "$TASK_ID" "$PR_URL" "$COMMIT_HASH"
+  exit 0
+fi
+
+APPROVED_CHECK="$("$GH_BIN" pr checks "$PR_NUMBER" --repo "$CURRENT_REPO" \
+  --json name,state \
+  --jq '.[] | select(.name=="ci-gatekeeper/approved") | .state' 2>/dev/null || echo "")"
+
+if [[ "$APPROVED_CHECK" == "SUCCESS" ]]; then
+  TELEMETRY_STATUS="success"
+else
+  TELEMETRY_STATUS="ci_failed"
+  echo "[$TASK_ID] ci-gatekeeper/approved check not green: '$APPROVED_CHECK'" >&2
+  printf '{"task_id":"%s","status":"ci_failed","pr":"%s","commit":"%s"}\n' \
+    "$TASK_ID" "$PR_URL" "$COMMIT_HASH"
+  exit 5
+fi
+
+# ── HAND-BACK JSON ────────────────────────────────────────────────────────────
+printf '{"task_id":"%s","status":"done","pr":"%s","commit":"%s","ci_status":"approved"}\n' \
+  "$TASK_ID" "$PR_URL" "$COMMIT_HASH"

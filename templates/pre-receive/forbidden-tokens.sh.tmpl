@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# pre-receive/forbidden-tokens.sh — server-side forbidden-token enforcer.
+#
+# Blocks pushes that introduce forbidden tokens in TypeScript, JavaScript, or Go
+# source files without a valid waiver (ISSUE-### reference on same/adjacent line
+# AND a docs/waivers.yaml entry).
+#
+# Forbidden tokens:
+#   %%FORBIDDEN_TOKENS%%
+#
+# Context passed by pre-receive dispatcher:
+#   HOOK_COMMITS_FILE  — path to file with one commit sha per line
+#   HOOK_FILES_FILE    — path to file with one changed filename per line
+#   HOOK_MESSAGES_FILE — path to file with NUL-delimited commit messages (unused here)
+#   GIT_DIR            — set by the git server to the bare repository path
+#
+# Exit 0 = clean. Exit 1 = violation found (push blocked).
+
+set -uo pipefail
+
+# git-list-files-in-commit SHA
+# Lists files added/modified in a commit. Handles root commits (no parent).
+git_files_in_commit() {
+  local sha="$1"
+  local empty_tree="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+  # Check if commit has a parent.
+  if git cat-file -e "${sha}^" 2>/dev/null; then
+    git diff-tree --no-commit-id -r --name-status "$sha" 2>/dev/null || true
+  else
+    # Root commit: diff against the empty tree.
+    git diff-tree --no-commit-id -r --name-status "${empty_tree}" "$sha" 2>/dev/null || true
+  fi
+}
+
+# Source file extensions subject to forbidden-token scanning.
+is_source_file() {
+  case "$1" in
+    *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts|*.mjs|*.cjs|*.go) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Forbidden patterns (grep -E extended regex).
+# Populated from %%FORBIDDEN_TOKENS%% at scaffold time if overridden;
+# otherwise the defaults below cover the standard governance token set.
+PATTERNS=(
+  '\.only\b'
+  '\.skip\b'
+  '\bxit\b'
+  '\bfdescribe\b'
+  '@ts-ignore'
+  '@ts-expect-error'
+  'eslint-disable'
+  '//nolint'
+)
+
+FOUND=0
+
+# Iterate over each commit in the push.
+while IFS= read -r SHA; do
+  [[ -z "$SHA" ]] && continue
+
+  # For each file changed in this commit, check only source files.
+  while IFS=$'\t' read -r STATUS FILENAME; do
+    [[ -z "$FILENAME" ]] && continue
+    # Skip deletions — no content to check.
+    [[ "$STATUS" == D* ]] && continue
+    is_source_file "$FILENAME" || continue
+
+    # Read the file content from the git object (no working tree needed).
+    FILE_CONTENT=$(git show "${SHA}:${FILENAME}" 2>/dev/null || true)
+    [[ -z "$FILE_CONTENT" ]] && continue
+
+    for PATTERN in "${PATTERNS[@]}"; do
+      # Find lines matching the pattern, with line numbers.
+      MATCHES=$(printf '%s\n' "$FILE_CONTENT" | grep -nE "$PATTERN" 2>/dev/null || true)
+      [[ -z "$MATCHES" ]] && continue
+
+      while IFS= read -r MATCH; do
+        [[ -z "$MATCH" ]] && continue
+        LINE_NO=$(printf '%s' "$MATCH" | cut -d: -f1)
+        LINE_CONTENT=$(printf '%s' "$MATCH" | cut -d: -f2-)
+
+        # Check for waiver: ISSUE-### must appear on the same or adjacent line.
+        PREV_LINE=$(( LINE_NO > 1 ? LINE_NO - 1 : 1 ))
+        NEXT_LINE=$(( LINE_NO + 1 ))
+        CONTEXT=$(printf '%s\n' "$FILE_CONTENT" | sed -n "${PREV_LINE},${NEXT_LINE}p" 2>/dev/null || true)
+
+        if printf '%s' "$CONTEXT" | grep -qE 'ISSUE-[0-9]+'; then
+          # ISSUE ref present — also require a docs/waivers.yaml entry.
+          WAIVERS=$(git show "${SHA}:docs/waivers.yaml" 2>/dev/null || true)
+          if [[ -n "$WAIVERS" ]]; then
+            # Match on full path only — basename fallback would allow a waiver
+            # for foo/bar.ts to also excuse baz/bar.ts.
+            if printf '%s' "$WAIVERS" | grep -qF "$FILENAME"; then
+              continue
+            fi
+          fi
+          # ISSUE ref present but no waivers.yaml entry — still a violation.
+          echo "[forbidden-tokens] ${SHA:0:8} ${FILENAME}:${LINE_NO}: ISSUE-### present but no docs/waivers.yaml entry." >&2
+          echo "  Token matched: ${LINE_CONTENT}" >&2
+          echo "  --> Add an entry to docs/waivers.yaml." >&2
+          FOUND=1
+        else
+          echo "[forbidden-tokens] ${SHA:0:8} ${FILENAME}:${LINE_NO}: forbidden token '${PATTERN}' without waiver." >&2
+          echo "  ${LINE_CONTENT}" >&2
+          echo "  --> Add ISSUE-### on adjacent line AND a docs/waivers.yaml entry." >&2
+          FOUND=1
+        fi
+      done <<< "$MATCHES"
+    done
+  done < <(git_files_in_commit "$SHA")
+done < "${HOOK_COMMITS_FILE:-/dev/null}"
+
+if [[ $FOUND -ne 0 ]]; then
+  echo "" >&2
+  echo "[forbidden-tokens] Push blocked. See violations above." >&2
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,122 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.12/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**/*.ts",
+      "**/*.tsx",
+      "**/*.js",
+      "**/*.jsx",
+      "**/*.json",
+      "!node_modules",
+      "!dist",
+      "!build",
+      "!.next",
+      "!out",
+      "!coverage",
+      "!*.tsbuildinfo",
+      "!.turbo",
+      "!.claude",
+      "!.opencode"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error",
+        "noUnusedPrivateClassMembers": "error",
+        "useExhaustiveDependencies": "warn"
+      },
+      "suspicious": {
+        "noExplicitAny": "error",
+        "noConsole": "warn",
+        "noDoubleEquals": "error",
+        "noShadowRestrictedNames": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "error",
+        "useConst": "error",
+        "useTemplate": "error",
+        "noParameterAssign": "error",
+        "useDefaultParameterLast": "error"
+      },
+      "complexity": {
+        "noForEach": "off",
+        "noBannedTypes": "error",
+        "noUselessCatch": "error"
+      },
+      "security": {
+        "noDangerouslySetInnerHtml": "error"
+      },
+      "performance": {
+        "noDelete": "warn"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "trailingCommas": "all",
+      "semicolons": "always",
+      "bracketSpacing": true,
+      "arrowParentheses": "always"
+    },
+    "linter": {
+      "enabled": true
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": true,
+      "trailingCommas": "none"
+    },
+    "linter": {
+      "enabled": true
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/*.config.ts", "**/*.config.js"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["ops/**", "scripts/**"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    }
+  ]
+}

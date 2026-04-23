@@ -1,0 +1,46 @@
+---
+id: TASK-000
+title: <imperative title, ≤80 chars>
+status: todo
+owner: <subagent-name from escalation matrix>
+depends_on: []
+files_allowlist:
+  - <glob>
+must_not_touch:
+  - %%PROTECTED_PATHS%%
+  - CLAUDE.md
+  - .claude/agents/**
+acceptance_criteria:
+  - <testable bullet naming a symbol, file, or observable behavior>
+pr: null
+commit: null
+ci_status: pending
+blocked_reason: null
+created: <YYYY-MM-DD>
+last_verified: null
+escalate_to: []
+plan: <docs/plans/YYYY-MM-DD-slug.md or null>
+---
+
+## Context
+
+One to three sentences. Why this task exists, what constraint or request drives it.
+
+## Out of scope
+
+Bullets explicitly excluded. Prevents subagent scope creep.
+
+## Inbound contract
+
+Subagent appends this block as the last action of its session, overwriting the stub below.
+
+```yaml
+task_id: TASK-000
+status: done | failed | blocked
+commit_hash: ""
+pr_url: null
+files_changed: []
+tests_added: []
+ci_status: approved | pending | failed | not_applicable
+blocked_reason: null
+```

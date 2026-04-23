@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LEAP_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${LEAP_HOME}/lib/utils.sh"
+
+case "${1:-help}" in
+  init)   source "${LEAP_HOME}/lib/init.sh" ;;
+  agents) source "${LEAP_HOME}/lib/agents.sh" ;;
+  help|--help|-h)
+    echo "leap — agent governance scaffolder"
+    echo ""
+    echo "Usage:"
+    echo "  leap init      Interview + scaffold governance skeleton"
+    echo "  leap agents    Interview + generate agent definitions"
+    echo "  leap help      Show this message"
+    ;;
+  *)
+    die "Unknown command: $1. Run 'leap help' for usage."
+    ;;
+esac

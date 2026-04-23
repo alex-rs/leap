@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# pre-receive/protected-paths.sh — protected-path enforcer.
+#
+# Blocks pushes that modify protected paths without a human `infra-approved:`
+# commit trailer.
+#
+# Protected paths (set at scaffold time via %%PROTECTED_PATHS%%):
+#   %%PROTECTED_PATHS%%
+#
+# Allowed trailer: infra-approved: <human-name>
+# Rejected values: empty, "agent:", "ci-gatekeeper", "claude*", "opencode*", "bot:*"
+#
+# Context passed by pre-receive dispatcher:
+#   HOOK_COMMITS_FILE — one commit sha per line
+#   GIT_DIR           — set by the git server to the bare repo path
+#
+# Exit 0 = clean. Exit 1 = violation (push blocked).
+
+set -uo pipefail
+
+EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# git-list-files-in-commit SHA — handles root commits.
+git_files_in_commit() {
+  local sha="$1"
+  if git cat-file -e "${sha}^" 2>/dev/null; then
+    git diff-tree --no-commit-id -r --name-status "$sha" 2>/dev/null || true
+  else
+    git diff-tree --no-commit-id -r --name-status "${EMPTY_TREE}" "$sha" 2>/dev/null || true
+  fi
+}
+
+# ------------------------------------------------------------------
+# Protected path patterns
+# Replace %%PROTECTED_PATHS%% at scaffold time with the project-specific
+# list of case patterns. The scaffold tool generates one `path/to/*)` line
+# per path entry in the PROTECTED_PATHS variable. Defaults cover the
+# standard governance infrastructure that must never be self-modified by agents.
+# ------------------------------------------------------------------
+is_protected_path() {
+  local file="$1"
+  case "$file" in
+    .github/workflows/*)        return 0 ;;
+    .gitea/workflows/*)         return 0 ;;
+    lefthook.yml)               return 0 ;;
+    ops/pre-receive/*)          return 0 ;;
+    ops/checks/*)               return 0 ;;
+    pre-receive/*)              return 0 ;;
+    checks/*)                   return 0 ;;
+    .eslintrc*)                 return 0 ;;
+    biome.json)                 return 0 ;;
+    .golangci.yml)              return 0 ;;
+    knip.config.ts)             return 0 ;;
+    knip.baseline.json)         return 0 ;;
+    docs/waivers.yaml)          return 0 ;;
+    coverage/baseline.json)     return 0 ;;
+    CLAUDE.md)                  return 0 ;;
+    .claude/agents/*)           return 0 ;;
+    docs/dev/ci-pipeline.md)    return 0 ;;
+    docs/security/*)            return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------------
+# Validate infra-approved trailer
+# ------------------------------------------------------------------
+has_valid_infra_approved_trailer() {
+  local msg="$1"
+  local trailer
+  trailer=$(printf '%s' "$msg" | grep -iE '^infra-approved:' | head -1 || true)
+  [[ -z "$trailer" ]] && return 1
+
+  local value
+  value=$(printf '%s' "$trailer" | sed 's/^[Ii]nfra-approved:[[:space:]]*//' | tr -d '[:space:]')
+  [[ -z "$value" ]] && return 1
+
+  # Reject agent-generated values.
+  case "${value,,}" in
+    agent:*|ci-gatekeeper|claude*|opencode*|bot:*) return 1 ;;
+  esac
+
+  return 0
+}
+
+FOUND=0
+
+while IFS= read -r SHA; do
+  [[ -z "$SHA" ]] && continue
+
+  # Get the list of protected files touched in this commit.
+  PROTECTED_IN_COMMIT=()
+  while IFS=$'\t' read -r STATUS FILENAME; do
+    [[ -z "$FILENAME" ]] && continue
+    if is_protected_path "$FILENAME"; then
+      PROTECTED_IN_COMMIT+=("$FILENAME")
+    fi
+  done < <(git_files_in_commit "$SHA")
+
+  [[ ${#PROTECTED_IN_COMMIT[@]} -eq 0 ]] && continue
+
+  # Check for valid infra-approved trailer.
+  COMMIT_MSG=$(git log -1 --format='%B' "$SHA" 2>/dev/null || true)
+
+  if ! has_valid_infra_approved_trailer "$COMMIT_MSG"; then
+    echo "[protected-paths] ${SHA:0:8}: modifies protected path(s) without 'infra-approved:' trailer." >&2
+    for F in "${PROTECTED_IN_COMMIT[@]}"; do
+      echo "  protected: $F" >&2
+    done
+    echo "  --> A human must add 'infra-approved: <your-name>' as a commit trailer." >&2
+    echo "  --> Agent trailers (ci-gatekeeper, agent:, claude, opencode) are not accepted." >&2
+    FOUND=1
+  fi
+done < "${HOOK_COMMITS_FILE:-/dev/null}"
+
+if [[ $FOUND -ne 0 ]]; then
+  echo "" >&2
+  echo "[protected-paths] Push blocked. Protected paths require human sign-off." >&2
+  exit 1
+fi
+
+exit 0

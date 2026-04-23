@@ -1,0 +1,73 @@
+.PHONY: dev hooks test lint check
+
+dev:
+	@echo "Starting %%PROJECT_NAME%% dev stack..."
+	docker compose up -d
+
+hooks:
+	lefthook install
+
+%%IF LANGUAGE_TYPESCRIPT%%
+test:
+	npx vitest run
+
+lint:
+	npx biome check .
+	npx knip
+
+check: lint test
+	npx tsc --noEmit
+	@echo "All checks passed."
+%%ENDIF%%
+
+%%IF LANGUAGE_PYTHON%%
+test:
+	pytest
+
+lint:
+	ruff check .
+	ruff format --check .
+
+check: lint test
+	mypy .
+	@echo "All checks passed."
+%%ENDIF%%
+
+%%IF LANGUAGE_GO%%
+test:
+	go test -race ./...
+
+lint:
+	golangci-lint run
+
+check: lint test
+	go vet ./...
+	@echo "All checks passed."
+%%ENDIF%%
+
+%%IF LANGUAGE_RUST%%
+test:
+	cargo test
+
+lint:
+	cargo clippy -- -D warnings
+	cargo fmt -- --check
+
+check: lint test
+	@echo "All checks passed."
+%%ENDIF%%
+
+%%IF LANGUAGE_MULTI%%
+test:
+	npx vitest run
+	go test -race ./...
+
+lint:
+	npx biome check .
+	golangci-lint run
+
+check: lint test
+	npx tsc --noEmit
+	go vet ./...
+	@echo "All checks passed."
+%%ENDIF%%
